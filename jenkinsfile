@@ -1,0 +1,89 @@
+pipeline {
+    agent any
+
+    environment {
+        GITHUB_REPO_URL = "https://github.com/iamSonaliGhuge/E-commerce-website.git"
+        EC2_USER = "ubuntu"
+        EC2_HOST = "54.234.63.144"       // Replace with your EC2 public IP
+        SSH_KEY = "springboot-ssh-key"   // Jenkins credential ID for your private SSH key
+        REMOTE_APP_PATH = "/opt/app/app.war"
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: "${https://github.com/iamSonaliGhuge/E-commerce-website.git}", credentialsId: "${SSH_KEY}"
+            }
+        }
+
+        stage('Build WAR with Maven') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+
+        stage('Transfer WAR to EC2') {
+            steps {
+                sshagent(credentials: ["${SSH_KEY}"]) {
+                    sh """
+                        WAR_NAME=\$(ls target/*.war | head -1)
+                        echo "Uploading artifact: \$WAR_NAME"
+
+                        # Delete old WAR/JAR if exists
+                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_HOST} "sudo rm -f /opt/app/*.war /opt/app/*.jar"
+
+                        # Upload new WAR
+                        scp -o StrictHostKeyChecking=no \$WAR_NAME ${EC2_USER}@${EC2_HOST}:${REMOTE_APP_PATH}
+                    """
+                }
+            }
+        }
+
+        stage('Restart Spring Boot Service') {
+            steps {
+                sshagent(credentials: ["${SSH_KEY}"]) {
+                    sh """
+                        echo "♻ Restarting Spring Boot service..."
+                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_HOST} \
+                        "sudo systemctl daemon-reload && sudo systemctl restart springapp"
+                    """
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh """
+                    echo "Waiting 30 sec for Spring Boot to start..."
+                    sleep 30
+
+                    for attempt in {1..8}; do
+                        echo "🔍 Checking health (attempt \$attempt)..."
+                        STATUS=\$(curl -o /dev/null -s -w "%{http_code}" http://${EC2_HOST}:8080/login)
+
+                        if [ "\$STATUS" = "200" ] || [ "\$STATUS" = "302" ] || [ "\$STATUS" = "404" ]; then
+                            echo "Application is healthy (HTTP \$STATUS)"
+                            exit 0
+                        fi
+
+                        echo "❗ Not ready — retrying in 6 sec (HTTP \$STATUS)"
+                        sleep 6
+                    done
+
+                    echo "❌ Application Health Check Failed"
+                    exit 1
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🚀 Deployment Successful! LIVE → http://${EC2_HOST}:8080/login"
+        }
+        failure {
+            echo "❌ Deployment Failed — Check pipeline logs"
+        }
+    }
+}
